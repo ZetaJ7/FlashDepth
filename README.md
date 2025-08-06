@@ -1,6 +1,6 @@
 # FlashDepth: Real-time Streaming Video Depth Estimation at 2K Resolution
 
-[**Paper**](https://arxiv.org/abs/2504.07093) | [**Project Page**](https://eyeline-research.github.io/FlashDepth/) <br>
+[**Paper**](https://arxiv.org/abs/2504.07093) | [**Project Page**](https://eyeline-labs.github.io/FlashDepth/) <br>
 
 
 This repository contains the official implementation of <br>
@@ -16,7 +16,7 @@ bash setup_env.sh
 ```
 
 ## Downloading Pretrained Models 
-We provide three checkpoints on huggingface. They correspond to [FlashDepth (Full)](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth), [FlashDepth-L](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth-l), and [FlashDepth-S](https://huggingface.co/Eyeline-Research/FlashDepth/tree/main/flashdepth-s), respectively, as referenced in the paper. Generally, FlashDepth-L is most accurate and FlashDepth (Full) is fastest, but we recommend using FlashDepth-L when the input resolution is low (e.g. short side less than 518).
+We provide three checkpoints on huggingface. They correspond to [FlashDepth (Full)](https://huggingface.co/Eyeline-Labs/FlashDepth/tree/main/flashdepth), [FlashDepth-L](https://huggingface.co/Eyeline-Labs/FlashDepth/tree/main/flashdepth-l), and [FlashDepth-S](https://huggingface.co/Eyeline-Labs/FlashDepth/tree/main/flashdepth-s), respectively, as referenced in the paper. Generally, FlashDepth-L is most accurate and FlashDepth (Full) is fastest, but we recommend using FlashDepth-L when the input resolution is low (e.g. short side less than 518).
 
 Save the checkpoints to `configs/flashdepth/iter_43002.pth`, `configs/flashdepth-l/iter_10001.pth`, and `configs/flashdepth-s/iter_14001.pth`, respectively. 
 
