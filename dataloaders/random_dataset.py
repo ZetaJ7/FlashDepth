@@ -84,3 +84,145 @@ class RandomDataset(Dataset):
             img_paths.append(frame_path)
         cap.release()
         return img_paths, tmpdirname
+
+class StreamDataset(Dataset):
+    def __init__(self, stream_url, resolution=None, crop_type=None, warmup_frames=5):
+        # StreamDataset simplified: only responsible for live stream capture
+        self.resolution = resolution
+        self.crop_type = crop_type
+        self.url = stream_url
+        self.cap = None
+
+        # Open capture immediately and perform warmup reads to reduce first-frame latency
+        try:
+            # Force TCP transport for better stability
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+            self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            
+            # Set multiple buffer-related properties for better real-time performance
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)  # Limit FPS to prevent overload
+            except Exception:
+                pass
+
+            if not self.cap.isOpened():
+                logging.warning(f"StreamDataset: failed to open stream {self.url} during init")
+            else:
+                # Pre-read and discard more frames to warm decoder and clear buffer
+                for _ in range(max(int(warmup_frames), 10)):
+                    ret, _ = self.cap.read()
+                    if not ret:
+                        break
+        except Exception as e:
+            logging.warning(f"StreamDataset init warning: {e}")
+
+    def __len__(self):
+        # For stream-like usage return a large finite number
+        return 10**9
+
+    def __getitem__(self, idx):
+        # Ensure capture is open (fallback if warmup/open failed at init)
+        if getattr(self, 'cap', None) is None or not self.cap.isOpened():
+            try:
+                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+                self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                try:
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    self.cap.set(cv2.CAP_PROP_FPS, 30)
+                except Exception:
+                    pass
+                if not self.cap.isOpened():
+                    raise ValueError(f"Error opening video stream {self.url}")
+                
+                # Warm up the new connection
+                for _ in range(5):
+                    ret, _ = self.cap.read()
+                    if not ret:
+                        break
+            except Exception as e:
+                logging.error(f"Failed to reopen stream: {e}")
+                raise ValueError(f"Error opening video stream {self.url}")
+
+        # Try to read frame with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            ret, frame = self.cap.read()
+            if ret and frame is not None and frame.size > 0:
+                break
+            else:
+                logging.warning(f"Failed to read frame (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.1)  # Brief pause before retry
+                else:
+                    raise RuntimeError("Error reading frame from stream after multiple attempts")
+
+        # Additional validation
+        if frame is None or frame.size == 0:
+            raise RuntimeError("Received empty frame from stream")
+
+        h, w = frame.shape[:2]
+        # normalize/parse resolution if configured (allow numeric strings)
+        res_val = None
+        if self.resolution is not None:
+            try:
+                res_val = int(self.resolution)
+            except Exception:
+                import re
+                s = str(self.resolution).lower()
+                m = re.search(r"\d+", s)
+                if m:
+                    num = int(m.group())
+                    # support shorthand like '2k' -> 2*1024
+                    if 'k' in s:
+                        res_val = num * 1024
+                    else:
+                        res_val = num
+
+        if res_val is not None and max(h, w) > res_val:
+            scale = res_val / max(h, w)
+            res = (int(w * scale), int(h * scale))
+        else:
+            res = (w, h)
+
+        img, _ = _load_and_process_image(frame, resolution=res, crop_type=self.crop_type)
+        # Normalize output to a torch tensor with shape (C, H, W)
+        if isinstance(img, torch.Tensor):
+            # Handle possible extra leading dims
+            if img.ndim == 4 and img.shape[0] == 1:
+                img = img.squeeze(0)
+            elif img.ndim == 5 and img.shape[0] == 1 and img.shape[1] == 1:
+                img = img.squeeze(0).squeeze(0)
+            # If img is (H, W, C) as tensor, permute to (C, H, W)
+            if img.ndim == 3 and img.shape[0] not in (1,3):
+                # guess HWC
+                img = img.permute(2, 0, 1)
+        else:
+            # numpy array
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3:
+                    # HWC -> CHW
+                    img = torch.from_numpy(img).permute(2, 0, 1)
+                elif img.ndim == 4 and img.shape[0] == 1:
+                    img = torch.from_numpy(img[0]).permute(2, 0, 1)
+                else:
+                    # fallback: convert and attempt to permute last dim to channels
+                    img = torch.from_numpy(img)
+                    if img.ndim == 3:
+                        img = img.permute(2, 0, 1)
+
+        img = img.float()
+
+        # sanity check spatial dims
+        if img.shape[-2] == 0 or img.shape[-1] == 0:
+            raise RuntimeError(f"Processed image has zero spatial dimension: {img.shape}")
+
+        return dict(batch=img.unsqueeze(0), scene_name="stream")
+
+    def __del__(self):
+        try:
+            if getattr(self, 'cap', None) is not None and self.cap.isOpened():
+                self.cap.release()
+        except Exception:
+            pass

@@ -38,3 +38,5 @@ wandb/
 *.distcp
 env/
 core.*
+*.mp4
+result/*

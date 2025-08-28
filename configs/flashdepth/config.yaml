@@ -70,17 +70,22 @@ hybrid_configs:
 
 # Evaluation configuration
 eval:
-  compile: true
+  url: "rtsp://10.20.16.136:10054/test"
+  stream_max_frames: 100
+  compile: false
   metrics: false
   save_grid: false
-  outfolder: "test"
+  outfolder: "result"
   test_datasets: [unreal4k,sintel,eth3d,waymo,urbansyn]
   test_dataset_resolution: '2k'
   random_input: null
   out_video: true # whether to save video at all
-  out_mp4: true # mp4 if true, gif if false
+  out_mp4: false # mp4 if true, gif if false (default changed to false)
   save_res: 518
   save_depth_npy: true
+  save_depth_png: true
+  save_frame_png: true
   save_vis_map: false
   dummy_timing: false
   large_dir: null
+  target_fps: 30  # Target FPS for stream processing to prevent overload

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import time 
+import cv2
 from einops import rearrange
 from PIL import Image
 import logging
@@ -197,7 +198,7 @@ class FlashDepth(nn.Module):
         # Process in batches of 60 frames
         # out = F.interpolate(out, (int(patch_h * self.patch_size), int(patch_w * self.patch_size)), mode="bilinear", align_corners=True)
         # int max is 2147483647; for B,C=128,H=518,W=518, can only handle 60 frames
-        # for vit-s using raw 2k resolution, can only handle 30 frames (2147483647/(32*1064*1904)=33)
+        # For vit-s using raw 2k resolution, can only handle 30 frames (2147483647/(32*1064*1904)=33)
         outputs = []
         for i in range(0, bs, 30):
             batch = out[i:i+30]  # Take up to 60 frames
@@ -219,8 +220,8 @@ class FlashDepth(nn.Module):
         video, gt_depth = batch 
         video = video.to(torch.cuda.current_device())
         
-        # multiplying gt disparity by 100 -> 1/meters to 100/meters; 
-        # magic number for training stability because gt is in meters but depthanythingv2 original output values in the hundreds
+        # Multiply gt disparity by 100: convert from 1/meters to 100/meters
+        # Magic number for training stability because gt is in meters but DepthAnythingV2 original output values are in the hundreds
         gt_depth = gt_depth.to(torch.cuda.current_device())* 100 
 
         self.mamba.start_new_sequence()
@@ -228,12 +229,12 @@ class FlashDepth(nn.Module):
         B, T, C, H, W = video.shape
         patch_h, patch_w = H // self.patch_size, W // self.patch_size
 
-        # reshape to (B*T, C, H, W) for ViT
+        # Reshape to (B*T, C, H, W) for ViT
         video = rearrange(video, 'b t c h w -> (b t) c h w')
         dpt_features = self.get_dpt_features(video, input_shape=(B, T, C, H, W)) # (B*T, c, h, w) where c=dpt_dim, h,w are also downsampled versions
         pred_depth = self.final_head(dpt_features, patch_h, patch_w) # (B*T, H, W)
 
-        # loss
+        # Loss calculation
         gt_depth = rearrange(gt_depth, 'b t h w -> (b t) h w')
         valid_mask = gt_depth >=0
 
@@ -248,7 +249,7 @@ class FlashDepth(nn.Module):
         if 'temporal' in loss_type and kwargs['timestep'] > 500:
             l1_loss = loss 
             
-            # Reshape back to B,T,H,W for temporal processing
+            # Reshape back to (B, T, H, W) for temporal processing
             pred_temporal = rearrange(pred_depth, '(b t) h w -> b t h w', b=B)
             gt_temporal = rearrange(gt_depth, '(b t) h w -> b t h w', b=B)
             valid_temporal = rearrange(valid_mask, '(b t) h w -> b t h w', b=B)
@@ -264,7 +265,7 @@ class FlashDepth(nn.Module):
                 valid_diff_k = (valid_temporal[:, k:] & valid_temporal[:, :-k])
                 
                 # Small change condition based on mean depth
-                # for each pixel independently, it checks if the depth change (gt_diff_k) is less than 20% of that pixel’s mean depth (mean_depth_k).
+                # For each pixel independently, check if the depth change (gt_diff_k) is less than 20% of that pixel's mean depth (mean_depth_k).
                 mean_depth_k = (gt_temporal[:, k:] + gt_temporal[:, :-k]) / 2
                 # relative_threshold_k = 0.2 * mean_depth_k
                 # small_change_mask_k = torch.abs(gt_diff_k) < relative_threshold_k
@@ -282,7 +283,7 @@ class FlashDepth(nn.Module):
        
        
         
-        ### debug, visualize training data
+        # Debug: visualize training data
         grid = None
         if vis_training:
             if dist.get_rank() == 0:
@@ -324,6 +325,9 @@ class FlashDepth(nn.Module):
         if use_mamba:
             self.mamba.start_new_sequence()
 
+        # initialize timing variable to avoid UnboundLocalError when print_time is used
+        start = None
+
         for i in range(video.shape[1]):
             warmup_frames = 5
             if kwargs.get('print_time', False) and i==warmup_frames:
@@ -358,7 +362,8 @@ class FlashDepth(nn.Module):
 
             preds.append(pred_depth)
         
-        if kwargs.get('print_time', False):
+        # print timing only if start was set successfully
+        if kwargs.get('print_time', False) and start is not None:
             try:
                 torch.cuda.synchronize()
                 end = time.time()
@@ -391,44 +396,95 @@ class FlashDepth(nn.Module):
 
         
         if save_depth_npy:
-            test_idx = gif_path.rstrip('.gif').split('_')[-1]
-            npy_path = os.path.join(os.path.dirname(gif_path), 'depth_npy_files') #, test_idx)
+            # Only use run_dir (i.e., stream_N folder) as the main directory for all outputs
+            base_dir = kwargs['run_dir'] if isinstance(kwargs, dict) and kwargs.get('run_dir') else os.getcwd()
+
+            base_name = os.path.splitext(os.path.basename(gif_path))[0]
+            npy_path = os.path.join(base_dir, 'depth_npy_files')
             os.makedirs(npy_path, exist_ok=True)
             for i in range(len(preds)):
-                np.save(f'{npy_path}/frame_{i}.npy', preds[i].cpu().float().numpy().squeeze(0))
+                np.save(f'{npy_path}/frame_{base_name}_{i}.npy', preds[i].cpu().float().numpy().squeeze(0))
+
+            # Save per-frame depth PNGs only if save_depth_png is True in config
+            if kwargs.get('save_depth_png', True):
+                try:
+                    png_path = os.path.join(base_dir, 'depth_pngs')
+                    os.makedirs(png_path, exist_ok=True)
+                    # Build a tensor of shape (T, H, W) from preds for conversion helper
+                    pred_list = [preds[i][0].cpu() for i in range(len(preds))]
+                    if len(pred_list) > 0:
+                        pred_tensor = torch.stack(pred_list)  # (T, H, W)
+                        pred_save = depth_to_np_arr(pred_tensor)  # Returns uint8 HxW or HxWx3 per frame
+                        for i in range(len(pred_save)):
+                            Image.fromarray(pred_save[i]).save(f'{png_path}/frame_{base_name}_{i}.png')
+                except Exception as e:
+                    logging.info(f"Error saving per-frame PNGs: {e}")
+
+            # Save each input frame as an image in frames/ folder under stream_{N} only if save_frame_png is True in config
+            if kwargs.get('save_frame_png', True):
+                try:
+                    frames_path = os.path.join(base_dir, 'frames')
+                    os.makedirs(frames_path, exist_ok=True)
+                    # video shape: (B, T, C, H, W) or (B, T, H, W, C) depending on input
+                    # Here, video is (B, T, C, H, W) and usually B=1
+                    video_frames = video[0]  # (T, C, H, W)
+                    for i in range(video_frames.shape[0]):
+                        frame = video_frames[i]
+                        # Convert tensor to numpy and transpose to (H, W, C)
+                        if frame.shape[0] == 3:
+                            frame_np = frame.cpu().numpy().transpose(1, 2, 0)
+                        else:
+                            frame_np = frame.cpu().numpy()
+                        # Convert to uint8 if needed
+                        if frame_np.dtype != 'uint8':
+                            frame_np = (frame_np * 255).clip(0, 255).astype('uint8')
+                        # Ensure frame is saved in RGB color space
+                        if frame_np.shape[-1] == 3:
+                            # Always save as RGB
+                            frame_np = frame_np[..., [0, 1, 2]]
+                        Image.fromarray(frame_np).save(f'{frames_path}/frame_{base_name}_{i}.png')
+                except Exception as e:
+                    logging.info(f"Error saving input frames: {e}")
+        # Skip composing GIF/MP4 outputs for stream inference. If users still want video, they can enable it
+        # via config overrides (eval.out_video=true) and we can re-enable this behavior later.
+        # if kwargs.get('out_video', True):
+        #     logging.info('Skipping GIF/MP4 output in save_and_return (only saving NPY/PNG).')
         
-        if kwargs.get('out_video', True):
-            try:
-                pred0 = []
-                for i in range(len(preds)):
-                    pred0.append(preds[i][0].cpu()) 
-                pred0 = torch.stack(pred0)
-                pred_save = depth_to_np_arr(pred0)
-                video_save = torch_batch_to_np_arr(video[0])
-                if gt_depth is not None:
-                    gt_save = depth_to_np_arr(gt_depth[0])
-                else:
-                    gt_save = None
+        # Temporarily disable GIF/MP4 generation by commenting out the original block below.
+        # if kwargs.get('out_video', True):
+        #     logging.info('Skipping GIF/MP4 output in save_and_return (only saving NPY/PNG).')
 
-                # inferno heat map
-                if save_vis_map:
-                    test_idx = gif_path.rstrip('.gif').split('_')[-1]
-                    vis_map_path = os.path.join(os.path.dirname(gif_path), 'vis_maps') #, test_idx)
-                    os.makedirs(vis_map_path, exist_ok=True)
-                    for i in range(len(pred_save)):
-                        Image.fromarray(pred_save[i]).save(f'{vis_map_path}/frame_{i}.png')
-
-                os.makedirs(os.path.dirname(gif_path), exist_ok=True)
-                if not out_mp4:
-                    grid = save_gifs_as_grid(video_save,gt_save,pred_save, output_path=gif_path, fixed_height=resolution)
-                else:
-                    grid = save_grid_to_mp4(video_save,gt_save,pred_save, output_path=gif_path.replace('.gif', '.mp4'), fixed_height=video.shape[-2])
-            except Exception as e:
-                logging.info(f"Error in saving video: {e}")
-                pass
-    
+        # Original video saving logic (commented out for stream-only default):
+        # try:
+        #     pred0 = []
+        #     for i in range(len(preds)):
+        #         pred0.append(preds[i][0].cpu()) 
+        #     pred0 = torch.stack(pred0)
+        #     pred_save = depth_to_np_arr(pred0)
+        #     video_save = torch_batch_to_np_arr(video[0])
+        #     if gt_depth is not None:
+        #         gt_save = depth_to_np_arr(gt_depth[0])
+        #     else:
+        #         gt_save = None
+        #
+        #     # inferno heat map
+        #     if save_vis_map:
+        #         test_idx = gif_path.rstrip('.gif').split('_')[-1]
+        #         vis_map_path = os.path.join(os.path.dirname(gif_path), 'vis_maps') #, test_idx)
+        #         os.makedirs(vis_map_path, exist_ok=True)
+        #         for i in range(len(pred_save)):
+        #             Image.fromarray(pred_save[i]).save(f'{vis_map_path}/frame_{i}.png')
+        #
+        #     os.makedirs(os.path.dirname(gif_path), exist_ok=True)
+        #     if not out_mp4:
+        #         grid = save_gifs_as_grid(video_save,gt_save,pred_save, output_path=gif_path, fixed_height=resolution)
+        #     else:
+        #         grid = save_grid_to_mp4(video_save,gt_save,pred_save, output_path=gif_path.replace('.gif', '.mp4'), fixed_height=video.shape[-2])
+        # except Exception as e:
+        #     logging.info(f"Error in saving video: {e}")
+        #     pass
+        
         return loss, grid
-
 
 
     # not using mamba

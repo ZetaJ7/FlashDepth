@@ -49,8 +49,22 @@ def depthanything_preprocess(image, width=None, height=None, to_tensor=True, col
 
 
 def _load_and_process_image(image_path, crop_type=None, resolution=None, resize_factor=1.0, **kwargs):
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) / 255.0
+    # Support either a file path (str / path-like) or an in-memory NumPy BGR image (from cv2.VideoCapture)
+    if isinstance(image_path, np.ndarray):
+        image = image_path
+        # Convert uint8 [0,255] to float32 [0,1] if necessary
+        if image.dtype == np.uint8:
+            image = image.astype(np.float32) / 255.0
+        else:
+            image = image.astype(np.float32)
+        # If image has 3 channels, assume it's BGR (OpenCV) and convert to RGB
+        if image.ndim == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Failed to read image from path: {image_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) / 255.0
     
     h, w = image.shape[:2]
     _current_crop = None
