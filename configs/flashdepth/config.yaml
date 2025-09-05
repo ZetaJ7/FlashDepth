@@ -1,8 +1,7 @@
 # General settings
 config_dir: null # overwrite by --config-path
-inference: false
-load: null  # path to pth file or 'true' when checkpoint exists in config_dir
-
+inference: true
+load: '/home/JunjieLi/FlashDepth/configs/flashdepth/iter_43002.pth'  # path to pth file or 'true' when checkpoint exists in config_dir
 
 # Dataset configuration
 dataset:
@@ -11,31 +10,6 @@ dataset:
   video_length: 5
   train_datasets: [mvs-synth,spring]  # Comma-separated list of dataset names
   val_datasets: [sintel,waymo]  # Comma-separated list of validation dataset names
-
-# Training configuration
-training:
-  batch_size: 4
-  workers: 10
-  gradient_checkpointing: true
-  save_freq: 1000
-  val_freq: 1000
-  vis_freq: 1000
-  total_iters: 60001
-  gradient_accumulation: 1
-  loss_type: "l1"
-  wandb: false
-  wandb_name: "experiment"
-  start_with_val: false
-  
-  
-  # Learning rate configuration
-  lr:
-    vit: 5.0e-6  # Set to 0 to freeze
-    fusion: 1.0e-4  # cross attention modules for hybrid model
-    dpt: 5.0e-5
-    head: 5.0e-5
-    mamba: 1.0e-4
-    warmup_steps: 1000
 
 # Model configuration
 model:
@@ -70,7 +44,8 @@ hybrid_configs:
 
 # Evaluation configuration
 eval:
-  url: "rtsp://10.20.16.136:10054/test"
+  # url: "rtsp://10.20.16.136:10054/test"
+  url: "rtsp://47.106.147.2:28551/test"
   stream_max_frames: 100
   compile: false
   metrics: false

@@ -19,16 +19,27 @@ from flashdepth.model import FlashDepth
 from .helpers import LinearWarmupExponentialDecay, get_warmup_lambda
 
 def dist_init():
-    local_rank = int(os.environ["LOCAL_RANK"])
-    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    # Check if running in distributed mode
+    if "LOCAL_RANK" in os.environ and "LOCAL_WORLD_SIZE" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
 
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group("nccl", timeout=timedelta(seconds=3600))
-    
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    node_idx = rank // local_world_size
-    num_nodes = world_size // local_world_size
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl", timeout=timedelta(seconds=3600))
+        
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        node_idx = rank // local_world_size
+        num_nodes = world_size // local_world_size
+    else:
+        # Single process mode
+        local_rank = 0
+        local_world_size = 1
+        rank = 0
+        world_size = 1
+        node_idx = 0
+        num_nodes = 1
+        # No need to init process group for single process
 
     seed = 42 + rank
     torch.manual_seed(seed)
@@ -47,245 +58,63 @@ def dist_init():
 
 def setup_model(cfg, process_dict):
     '''
-    1. instantiate model
-    2. apply gradient checkpointing
-    3. wrap with DDP
-    4. setup optimizer and scheduler
-    5. load checkpoint if needed
+    Instantiate model and load weights for inference only.
     '''
-    # MODEL
-    model = FlashDepth(**dict( 
-        batch_size=cfg.training.batch_size, 
-        hybrid_configs=cfg.hybrid_configs,
-        training=not cfg.inference,
+    model = FlashDepth(**dict(
+        batch_size=1,  # Inference batch size fixed为1
+        training=False,
         **cfg.model,
     ))
     model = model.to(torch.cuda.current_device())
-
-    # Setup optimizer and scheduler
-    if not cfg.inference:
-        
-        optim_list = []
-
-        for param in model.parameters():
-            param.requires_grad = False
-
-        if cfg.training.lr.vit:
-            for param in model.pretrained.parameters():
-                param.requires_grad = True
-
-            vit_params = {"params": model.pretrained.parameters(), "lr": cfg.training.lr.vit}
-            optim_list.append(vit_params)
-
-        if cfg.training.lr.dpt:
-            for param in model.depth_head.parameters():
-                param.requires_grad = True
-
-            dpt_params = {"params": model.depth_head.parameters(), "lr": cfg.training.lr.dpt}
-            optim_list.append(dpt_params)
-            
-
-        if cfg.training.lr.mamba and cfg.model.use_mamba:
-            for param in model.mamba.parameters():
-                param.requires_grad = True
-            mamba_params = {"params": model.mamba.parameters(), "lr": cfg.training.lr.mamba}
-            optim_list.append(mamba_params)
-
-
-        if cfg.hybrid_configs.use_hybrid:
-            for param in model.teacher_model.parameters():
-                param.requires_grad = False
-
-            assert cfg.hybrid_configs.teacher_model_path is not None, 'teacher model path is not specified'
-            teacher_ckpt_path = cfg.hybrid_configs.teacher_model_path
-            teacher_ckpt = torch.load(teacher_ckpt_path, map_location='cpu')
-            current_teacher_keys = set(model.teacher_model.state_dict().keys())
-            pretrained_teacher_keys = set(teacher_ckpt['model'].keys())
-            missing_keys = current_teacher_keys - pretrained_teacher_keys
-            unexpected_keys = pretrained_teacher_keys - current_teacher_keys
-            overlapping_keys = current_teacher_keys & pretrained_teacher_keys
-            assert len(overlapping_keys)==407, 'check teacher model keys'
-            model.teacher_model.load_state_dict(teacher_ckpt['model'], strict=False)
-
-
-            logging.info(f"loaded teacher model from {teacher_ckpt_path.split('mamba/')[1]}!!")
-
-            for param in model.hybrid_fusion.parameters():
-                param.requires_grad = True
-
-            fusion_group = {"params": model.hybrid_fusion.parameters(), "lr": cfg.training.lr.fusion}
-            optim_list.append(fusion_group)
-
-                    
-        optimizer = torch.optim.AdamW(
-            optim_list,
-            betas=[0.9, 0.95]
-        )
-        from torch.optim.lr_scheduler import LambdaLR
-        warmup_lambda = get_warmup_lambda(cfg.training.lr.warmup_steps)
-        scheduler = LambdaLR(optimizer, lr_lambda=[warmup_lambda]*len(optim_list))
-
-    else:
-        optimizer, scheduler = None, None
 
     # Load checkpoint if specified
     train_step = 0
     if cfg.load is not None or cfg.inference:
         model = model.cpu()
-        train_step = load_checkpoint(cfg, model, optimizer, scheduler)
-        
-        # # Move optimizer states to CUDA
-        if optimizer is not None:
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(torch.cuda.current_device())
-
+        train_step = load_checkpoint(cfg, model)
         model = model.to(torch.cuda.current_device())
 
+    return model, train_step
 
-    # Apply gradient checkpointing before DDP wrapping
-    if cfg.training.gradient_checkpointing and not cfg.inference:
-        apply_activation_checkpointing(
-            getattr(model, 'pretrained'),
-            checkpoint_wrapper_fn=checkpoint_wrapper,
-            check_fn=lambda _: True  
-        )
-        apply_activation_checkpointing(
-            getattr(model, 'depth_head'),
-            checkpoint_wrapper_fn=checkpoint_wrapper,
-            check_fn=lambda _: True  
-        )
-        
-        # not compatible
-        # if cfg.model.use_mamba:
-        #     apply_activation_checkpointing(
-        #         getattr(model, 'mamba'),
-        #         checkpoint_wrapper_fn=checkpoint_wrapper,
-        #         check_fn=lambda _: True  
-        #     )
-
-        if cfg.hybrid_configs.use_hybrid:
-            apply_activation_checkpointing(
-                getattr(model, 'teacher_model'),
-                checkpoint_wrapper_fn=checkpoint_wrapper,
-                check_fn=lambda _: True  
-            )
-
-        logging.info("Using gradient checkpointing!")
-
-    # Wrap with DDP
-    model = DDP(
-        model,
-        device_ids=[process_dict['local_rank']],
-        find_unused_parameters=True,
-    )
-
-    dist.barrier()
-
-    return model, optimizer, scheduler, train_step
-
-def load_checkpoint(cfg, model, optimizer, lr_scheduler):
-    
-    if cfg.load is not None and cfg.inference and '.pth' in cfg.load: 
-        checkpoint_path = cfg.load
-        pretrained = False
-        logging.info(f"force loading checkpoint {checkpoint_path}...")   
-
-    else: 
+def load_checkpoint(cfg, model):
+    if cfg.load is not None and cfg.inference:
+        if isinstance(cfg.load, str) and '.pth' in cfg.load:
+            print(cfg.load)
+            checkpoint_path = cfg.load
+            logging.info(f"force loading checkpoint {checkpoint_path}...")
+        elif cfg.load is True:
+            print(cfg)
+            existing_ckpts = get_existing_ckpts(cfg)
+            if existing_ckpts:
+                checkpoint_path = existing_ckpts[-1]
+                logging.info(f"loading latest checkpoint {checkpoint_path}...")
+            else:
+                raise FileNotFoundError(f"No checkpoints found in config_dir ({existing_ckpts}), cannot load model!")
+        else:
+            print(cfg)
+            existing_ckpts = get_existing_ckpts(cfg)
+            if existing_ckpts:
+                checkpoint_path = existing_ckpts[-1]
+                logging.info(f"loading latest checkpoint {checkpoint_path}...")
+            else:
+                raise FileNotFoundError(f"No checkpoints found in config_dir ({existing_ckpts}), cannot load model!")
+    else:
         existing_ckpts = get_existing_ckpts(cfg)
         if len(existing_ckpts) > 0:
             checkpoint_path = existing_ckpts[-1]
-            pretrained = False
         else:
             checkpoint_path = cfg.load
-            pretrained = True
-            logging.info(f"assuming checkpoint is pretrained and init new optimizer...")    
-    
+            logging.info(f"assuming checkpoint is pretrained...")
         logging.info(f"existing ckpts: {existing_ckpts}")
         logging.info(f"loading checkpoint from {checkpoint_path}...")
 
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint path {checkpoint_path} does not exist, cannot load model!")
+
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    
-
-
-    if pretrained:
-        model_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-        manual_filters = []
-
-        # Check overlapping keys between pretrained and current model
-        current_keys = set(model.state_dict().keys())
-        pretrained_keys = set(model_state_dict.keys())
-        
-        overlapping = current_keys & pretrained_keys
-        missing = current_keys - pretrained_keys
-        unexpected = pretrained_keys - current_keys
-        
-        logging.info(f"Number of overlapping keys: {len(overlapping)}")
-        logging.info(f"Number of missing keys: {len(missing)}")
-        logging.info(f"Number of unexpected keys: {len(unexpected)}")
-
-                
-        # if len(missing) > 0:
-        #     logging.info(f"Missing keys: {missing}")
-        # if len(unexpected) > 0:
-        #     logging.info(f"Unexpected keys: {unexpected}")
-        # if len(overlapping) > 0:
-        #     logging.info(f"Overlapping keys: {overlapping}")
-    
-        # if args.use_new_prediction_head or 'pretrained' in checkpoint_path:
-        #     manual_filters.extend(['head'])
-
-        # if len(manual_filters) > 0:
-        #     model_state_dict = {k: v for k, v in model_state_dict.items() 
-        #                       if not any([attr in k for attr in manual_filters])}
-        
-        model.load_state_dict(model_state_dict, strict=False)
-        train_step = 0
-    else:
-
-        model_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
-
-
-        # # previous version to current
-        # filtered_state_dict = {}
-        # for k, v in model_state_dict.items():
-        #     if "output_conv" in k and "depth_head" not in k:
-        #         logging.info(f"Skipping deprecated key: {k}")
-        #         continue
-                
-        #     if "mamba.blocks" in k:
-        #         new_key = k.replace("mamba.blocks", "mamba.blocks.0")
-        #         logging.info(f"Updating key: {k} -> {new_key}")
-        #         filtered_state_dict[new_key] = v
-        #     elif "distillation" in k:
-        #         new_key = k.replace("distillation", "hybrid")
-        #         logging.info(f"Updating key: {k} -> {new_key}")
-        #         filtered_state_dict[new_key] = v
-        #     else:
-        #         filtered_state_dict[k] = v
-        # model_state_dict = filtered_state_dict
-
-        # filtered_state_dict = {}
-        # for k, v in model_state_dict.items():
-        #     if "mamba" in k:
-        #         continue
-        #     else:
-        #         filtered_state_dict[k] = v
-        # model_state_dict = filtered_state_dict
-
-        # import ipdb; ipdb.set_trace()
-
-        model.load_state_dict(model_state_dict, strict=True)
-        if optimizer is not None:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        
-        
-        if lr_scheduler is not None and 'lr_scheduler' in checkpoint:
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            logging.info(f"scheduler loaded successfully!")
-        train_step = checkpoint.get('step', 0)
-    
+    model_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+    model.load_state_dict(model_state_dict, strict=False)
+    train_step = checkpoint.get('step', 0)
     logging.info(f"checkpoint loaded successfully!")
     return train_step
 
