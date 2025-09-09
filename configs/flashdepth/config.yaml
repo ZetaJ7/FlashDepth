@@ -1,7 +1,7 @@
 # General settings
 config_dir: null # overwrite by --config-path
 inference: true
-load: '/home/test/Lijunjie/FlashDepth/configs/flashdepth/iter_43002.pth'  # path to pth file or 'true' when checkpoint exists in config_dir
+load: '/home/test/Lijunjie/Pano2stereo/models/flashdepth.pth'  # path to pth file or 'true' when checkpoint exists in config_dir
 
 # Dataset configuration
 dataset:

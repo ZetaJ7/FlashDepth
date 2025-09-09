@@ -11,28 +11,29 @@ from utils import logging_config
 from dataloaders.random_dataset import StreamDataset
 from omegaconf import OmegaConf
 import matplotlib.pyplot as plt  # Added for depth visualization
+import cv2
 
 class FlashDepthProcessor:
-    def __init__(self, config_path="configs/flashdepth",stream_mode=False,save_depth_png=False,max_frames=None):
+    def __init__(self, config_path="configs/flashdepth",stream_mode=False,save_depth_png=False,save_frame=False,max_frames=None):
         self.cfg = None
         self.process_dict = None
         self.run_dir = None
+        self.pred = None  # To store the latest depth map
         self._load_config(config_path)
         self._setup()
         self.stream_mode = stream_mode
         self.save_depth_png = save_depth_png
         self.max_frames = max_frames
+        self.save_frame = None  # To store the latest original frame
         
     def _load_config(self, config_path):
         """Load configuration using OmegaConf."""
         
-        config_file = os.path.join(config_path, "config.yaml")
-        
-        if os.path.exists(config_file):
-            self.cfg = OmegaConf.load(config_file)
-            logging.info(f"Loaded config from: {config_file}")
+        if os.path.exists(config_path):
+            self.cfg = OmegaConf.load(config_path)
+            logging.info(f"Loaded config from: {config_path}")
         else:
-            raise FileNotFoundError(f"Config file not found: {config_file}")
+            raise FileNotFoundError(f"Config file not found: {config_path}")
         
     def _setup(self):
         # initialize distributed/process
@@ -88,6 +89,7 @@ class FlashDepthProcessor:
             'save_depth_png': cfg.eval.save_depth_png,
             'save_depth_npy': cfg.eval.save_depth_npy,
             'save_vis_map': cfg.eval.save_vis_map,
+            'save_frame_png': cfg.eval.save_frame_png,
             'out_video': cfg.eval.out_video,
             'out_mp4': cfg.eval.out_mp4,
             'use_mamba': cfg.model.use_mamba,
@@ -132,6 +134,10 @@ class FlashDepthProcessor:
             self.save_depth_png = eval_args.get('save_depth_png', False)
         logging.info(f"[Save Depth PNG]: {self.save_depth_png}")
 
+        if not self.save_frame:
+            self.save_frame = eval_args.get('save_frame_png', False)
+        logging.info(f"[Save Original Frame]: {self.save_frame}")
+
         if self.max_frames is None:
             pbar = tqdm(test_dataloader)
         else:
@@ -149,8 +155,11 @@ class FlashDepthProcessor:
                 logging.info(f'Reached max_frames {self.max_frames}, stopping')
                 break
 
-            if isinstance(batch, dict):
+            # Get batch and original frame    
+            if isinstance(batch, dict): # _get_item_: return dict(batch=img.unsqueeze(0), frame=origin_frame)
                 batch_tensor = batch['batch']
+                original_frame = batch['frame']  # Original frame if available
+                original_frame = original_frame.squeeze(0)  # 在GPU上展开为 [H, W, C]
             else:
                 batch_tensor = batch
 
@@ -159,30 +168,34 @@ class FlashDepthProcessor:
                 batch_tensor = batch_tensor.to(model_device)
             
             if self.save_depth_png:
-                png_dir = f'{run_dir}/depth_PNGs'
+                png_dir = f'{run_dir}/saved_PNGs'
                 os.makedirs(png_dir, exist_ok=True)
 
             try:
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                     if self.stream_mode:
                         # Stream mode: return single depth (H, W)
-                        pred_depth = model(
+                        depth_pred = model(
                             batch_tensor,
                             gif_path=f'{run_dir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
                             **eval_args
                         )
+                        self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
                         # Visualize and save depth as PNG
                         if self.save_depth_png:
-                            depth_np = pred_depth.float().cpu().numpy()
-                            plt.imsave(f'{png_dir}/depth_{test_idx}.png', depth_np, cmap='inferno')
-                        img_grid = None
-                    else:
-                        # Normal mode: return loss, grid
-                        _, img_grid = model(
-                            batch_tensor,
-                            gif_path=f'{run_dir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
-                            **eval_args
-                        )
+                            depth_np = depth_pred.float().cpu().numpy()
+                            plt.imsave(f'{png_dir}/{test_idx}_depth.png', depth_np, cmap='inferno')
+                        if self.save_frame and original_frame is not None:
+                            frame_np = original_frame.cpu().numpy()  # 已经展开，直接转换为numpy
+                            frame_np = cv2.cvtColor(frame_np, cv2.COLOR_BGR2RGB)  # 转换为 RGB 颜色空间
+                            plt.imsave(f'{png_dir}/{test_idx}_frame.png', frame_np)
+                    # else:
+                    #     # Normal mode: return loss, grid
+                    #     _, img_grid = model(
+                    #         batch_tensor,
+                    #         gif_path=f'{run_dir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
+                    #         **eval_args
+                    #     )
             except Exception as e:
                 logging.warning(f"Error processing frame {test_idx}: {e}")
                 continue
@@ -199,7 +212,11 @@ class FlashDepthProcessor:
 
 if __name__ == '__main__':
     # Create processor with default config path
-    processor = FlashDepthProcessor(max_frames=100)  # Example: test 100 frames
+    processor = FlashDepthProcessor(config_path='/home/test/Lijunjie/Pano2stereo/submodule/Flashdepth/configs/flashdepth/config.yaml',
+                                    save_depth_png=True,
+                                    save_frame=True,
+                                    stream_mode=True,
+                                    max_frames=50)  # Example: test 100 frames
     try:
         processor.run_inference()
     finally:

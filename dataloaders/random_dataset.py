@@ -145,16 +145,17 @@ class StreamDataset(Dataset):
                 raise ValueError(f"Error opening video stream {self.url}")
 
         # Try to read frame with retry mechanism
-        max_retries = 3
+        max_retries = 1
         for attempt in range(max_retries):
             ret, frame = self.cap.read()
+            origin_frame = frame.copy() if ret else None
             if ret and frame is not None and frame.size > 0:
                 break
             else:
                 logging.warning(f"Failed to read frame (attempt {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
                     import time
-                    time.sleep(0.1)  # Brief pause before retry
+                    time.sleep(0.01)  # Brief pause before retry
                 else:
                     raise RuntimeError("Error reading frame from stream after multiple attempts")
 
@@ -218,7 +219,7 @@ class StreamDataset(Dataset):
         if img.shape[-2] == 0 or img.shape[-1] == 0:
             raise RuntimeError(f"Processed image has zero spatial dimension: {img.shape}")
 
-        return dict(batch=img.unsqueeze(0), scene_name="stream")
+        return dict(batch=img.unsqueeze(0), frame=origin_frame)
 
     def __del__(self):
         try:
