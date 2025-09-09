@@ -79,11 +79,9 @@ def setup_model(cfg, process_dict):
 def load_checkpoint(cfg, model):
     if cfg.load is not None and cfg.inference:
         if isinstance(cfg.load, str) and '.pth' in cfg.load:
-            print(cfg.load)
             checkpoint_path = cfg.load
             logging.info(f"force loading checkpoint {checkpoint_path}...")
         elif cfg.load is True:
-            print(cfg)
             existing_ckpts = get_existing_ckpts(cfg)
             if existing_ckpts:
                 checkpoint_path = existing_ckpts[-1]
@@ -91,7 +89,6 @@ def load_checkpoint(cfg, model):
             else:
                 raise FileNotFoundError(f"No checkpoints found in config_dir ({existing_ckpts}), cannot load model!")
         else:
-            print(cfg)
             existing_ckpts = get_existing_ckpts(cfg)
             if existing_ckpts:
                 checkpoint_path = existing_ckpts[-1]
@@ -111,7 +108,7 @@ def load_checkpoint(cfg, model):
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint path {checkpoint_path} does not exist, cannot load model!")
 
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     model_state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
     model.load_state_dict(model_state_dict, strict=False)
     train_step = checkpoint.get('step', 0)

@@ -1,9 +1,7 @@
 import warnings
-# warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 import os
 from tqdm import tqdm
-import wandb
-os.environ["WANDB__SERVICE_WAIT"] = "300"
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -12,14 +10,18 @@ import logging
 from utils import logging_config
 from dataloaders.random_dataset import StreamDataset
 from omegaconf import OmegaConf
+import matplotlib.pyplot as plt  # Added for depth visualization
 
 class FlashDepthProcessor:
-    def __init__(self, config_path="configs/flashdepth"):
+    def __init__(self, config_path="configs/flashdepth",stream_mode=False,save_depth_png=False,max_frames=None):
         self.cfg = None
         self.process_dict = None
         self.run_dir = None
         self._load_config(config_path)
         self._setup()
+        self.stream_mode = stream_mode
+        self.save_depth_png = save_depth_png
+        self.max_frames = max_frames
         
     def _load_config(self, config_path):
         """Load configuration using OmegaConf."""
@@ -28,7 +30,7 @@ class FlashDepthProcessor:
         
         if os.path.exists(config_file):
             self.cfg = OmegaConf.load(config_file)
-            print(f"Loaded config from: {config_file}")
+            logging.info(f"Loaded config from: {config_file}")
         else:
             raise FileNotFoundError(f"Config file not found: {config_file}")
         
@@ -64,6 +66,7 @@ class FlashDepthProcessor:
     def run_inference(self):
         """Run stream inference (only inference logic)."""
         cfg = self.cfg
+        logging.info('[cfg]:{}'.format(cfg))
         process_dict = self.process_dict
         run_dir = self.run_dir
 
@@ -77,11 +80,12 @@ class FlashDepthProcessor:
         if getattr(cfg.eval, 'compile', False):
             model = torch.compile(model)
 
-        os.makedirs(run_dir, exist_ok=True)
-        print('[inference run_dir]:{}'.format(run_dir))
+        logging.info('[inference Run_dir]:{}'.format(run_dir))
 
         # Build eval_args, all outputs use run_dir
         eval_args = {
+            'stream': cfg.eval.stream,
+            'save_depth_png': cfg.eval.save_depth_png,
             'save_depth_npy': cfg.eval.save_depth_npy,
             'save_vis_map': cfg.eval.save_vis_map,
             'out_video': cfg.eval.out_video,
@@ -90,8 +94,6 @@ class FlashDepthProcessor:
             'resolution': cfg.eval.save_res,
             'print_time': True,
             'use_all_frames': True,
-            'use_metrics': False,
-            'dummy_timing': cfg.eval.dummy_timing,
             'run_dir': run_dir
         }
 
@@ -101,16 +103,15 @@ class FlashDepthProcessor:
             raise ValueError('Stream address required: set cfg.eval.stream_url or cfg.eval.url')
 
         warmup = getattr(cfg.eval, 'stream_warmup_frames', 5)
-        max_frames = getattr(cfg.eval, 'stream_max_frames', None)
-        if max_frames is not None:
+        if self.max_frames is not None:
             try:
-                max_frames = int(max_frames)
-                if max_frames <= 0:
-                    max_frames = None
+                self.max_frames = int(self.max_frames)
+                if self.max_frames <= 0:
+                    self.max_frames = None
             except Exception:
-                logging.warning(f"Invalid cfg.eval.stream_max_frames value: {max_frames!r}. Treating as unlimited.")
-                max_frames = None
-        logging.info(f"Stream max frames set to: {max_frames}")
+                logging.warning(f"Invalid max_frames value: {self.max_frames!r}. Treating as unlimited.")
+                self.max_frames = None
+        logging.info(f"Stream Max frames set to: {self.max_frames}")
 
         logging.info('Using URL input: {}'.format(stream_addr))
         dataset = StreamDataset(stream_url=stream_addr, resolution=cfg.dataset.resolution, warmup_frames=warmup)
@@ -122,11 +123,21 @@ class FlashDepthProcessor:
         target_fps = getattr(cfg.eval, 'target_fps', 30)
         frame_interval = 1.0 / target_fps if target_fps > 0 else 0
 
-        if max_frames is None:
+        # Pre-check flags for efficiency
+        if not self.stream_mode:
+            self.stream_mode = eval_args.get('stream', False)
+        logging.info(f"[Stream Mode]: {self.stream_mode}")
+
+        if not self.save_depth_png:
+            self.save_depth_png = eval_args.get('save_depth_png', False)
+        logging.info(f"[Save Depth PNG]: {self.save_depth_png}")
+
+        if self.max_frames is None:
             pbar = tqdm(test_dataloader)
         else:
-            pbar = tqdm(test_dataloader, total=max_frames)
+            pbar = tqdm(test_dataloader, total=self.max_frames)
 
+        # MAIN LOOP
         for test_idx, batch in enumerate(pbar):
             current_time = time.time()
             if frame_interval > 0 and current_time - last_frame_time < frame_interval:
@@ -134,31 +145,44 @@ class FlashDepthProcessor:
                 time.sleep(sleep_time)
             last_frame_time = time.time()
 
-            if (max_frames is not None) and (test_idx >= int(max_frames)):
-                logging.info(f'Reached max_frames {max_frames}, stopping')
+            if (self.max_frames is not None) and (test_idx >= int(self.max_frames)):
+                logging.info(f'Reached max_frames {self.max_frames}, stopping')
                 break
 
             if isinstance(batch, dict):
                 batch_tensor = batch['batch']
-                save_subdir = run_dir
-                os.makedirs(save_subdir, exist_ok=True)
             else:
                 batch_tensor = batch
-                save_subdir = run_dir
 
             model_device = next(model.parameters()).device
             if isinstance(batch_tensor, torch.Tensor) and batch_tensor.device != model_device:
                 batch_tensor = batch_tensor.to(model_device)
+            
+            if self.save_depth_png:
+                png_dir = f'{run_dir}/depth_PNGs'
+                os.makedirs(png_dir, exist_ok=True)
 
             try:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    _, img_grid = model(
-                        batch_tensor,
-                        gif_path=f'{save_subdir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
-                        **eval_args
-                    )
-                if getattr(cfg.eval, 'save_grid', False) and img_grid is not None:
-                    img_grid.save(f'{save_subdir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.png')
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    if self.stream_mode:
+                        # Stream mode: return single depth (H, W)
+                        pred_depth = model(
+                            batch_tensor,
+                            gif_path=f'{run_dir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
+                            **eval_args
+                        )
+                        # Visualize and save depth as PNG
+                        if self.save_depth_png:
+                            depth_np = pred_depth.float().cpu().numpy()
+                            plt.imsave(f'{png_dir}/depth_{test_idx}.png', depth_np, cmap='inferno')
+                        img_grid = None
+                    else:
+                        # Normal mode: return loss, grid
+                        _, img_grid = model(
+                            batch_tensor,
+                            gif_path=f'{run_dir}/{os.path.basename(getattr(cfg, "config_dir", "cfg").rstrip("/"))}_{train_step}_{test_idx}.gif',
+                            **eval_args
+                        )
             except Exception as e:
                 logging.warning(f"Error processing frame {test_idx}: {e}")
                 continue
@@ -175,7 +199,7 @@ class FlashDepthProcessor:
 
 if __name__ == '__main__':
     # Create processor with default config path
-    processor = FlashDepthProcessor()
+    processor = FlashDepthProcessor(max_frames=100)  # Example: test 100 frames
     try:
         processor.run_inference()
     finally:

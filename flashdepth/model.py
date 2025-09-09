@@ -213,6 +213,24 @@ class FlashDepth(nn.Module):
         depth = F.relu(out).squeeze(1)
     
         return depth
+    
+    @torch.no_grad()
+    def forward_single_frame(self, frame, use_mamba, **kwargs):
+        """
+        单帧推理：输入单帧 (1, C, H, W)，返回单帧深度 (H, W)
+        """
+        if use_mamba:
+            self.mamba.start_new_sequence()
+        
+        B, C, H, W = frame.shape
+        assert B==1, "Batch size must be 1 for single frame inference"
+        patch_h, patch_w = H // self.patch_size, W // self.patch_size
+        
+        dpt_features = self.get_dpt_features(frame, input_shape=(B, C, H, W))
+        pred_depth = self.final_head(dpt_features, patch_h, patch_w)
+        pred_depth = torch.clip(pred_depth, min=0)
+        
+        return pred_depth.squeeze(0)  # (H, W)
 
 
     def train_sequence(self, batch, loss_type='l1', vis_training=False, savedir='debug_training', **kwargs):
@@ -310,7 +328,7 @@ class FlashDepth(nn.Module):
     
     
     @torch.no_grad()
-    def forward(self, batch, use_mamba, gif_path, resolution, out_mp4 ,save_depth_npy=False, save_vis_map=False, **kwargs):
+    def forward(self, batch, use_mamba, gif_path, resolution, out_mp4 ,save_depth_npy=False, save_vis_map=False, stream=False, **kwargs):
         
         # both have shape (B, T, C, H, W)
         if isinstance(batch, list) or isinstance(batch, tuple):
@@ -318,6 +336,14 @@ class FlashDepth(nn.Module):
         elif isinstance(batch, torch.Tensor):
             video = batch
             gt_depth = None
+        
+        #  Stream mode
+        if stream:
+            assert video.shape[1] == 1, "For stream inference, input video must have T=1 (a single frame)"
+            frame = video[:, 0, :, :, :].to(torch.cuda.current_device())
+            pred_depth = self.forward_single_frame(frame, use_mamba, **kwargs)
+            # print('Stream depth shape:', pred_depth.shape)
+            return pred_depth  # 返回 (H, W)
         
         preds = []
 
@@ -523,3 +549,5 @@ class FlashDepth(nn.Module):
       
 
         return loss, grid
+    
+

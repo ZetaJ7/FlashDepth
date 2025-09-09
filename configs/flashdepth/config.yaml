@@ -1,7 +1,7 @@
 # General settings
 config_dir: null # overwrite by --config-path
 inference: true
-load: '/home/JunjieLi/FlashDepth/configs/flashdepth/iter_43002.pth'  # path to pth file or 'true' when checkpoint exists in config_dir
+load: '/home/test/Lijunjie/FlashDepth/configs/flashdepth/iter_43002.pth'  # path to pth file or 'true' when checkpoint exists in config_dir
 
 # Dataset configuration
 dataset:
@@ -45,7 +45,8 @@ hybrid_configs:
 # Evaluation configuration
 eval:
   # url: "rtsp://10.20.16.136:10054/test"
-  url: "rtsp://47.106.147.2:28551/test"
+  url: "rtsp://10.20.35.30:28552/test"
+  stream: true  # whether to use stream inference mode
   stream_max_frames: 100
   compile: false
   metrics: false
