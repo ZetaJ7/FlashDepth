@@ -15,7 +15,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flashdepth.model import FlashDepth
+from ..flashdepth.model import FlashDepth
 from .helpers import LinearWarmupExponentialDecay, get_warmup_lambda
 
 def dist_init():

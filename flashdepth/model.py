@@ -17,9 +17,9 @@ from .original_dpt import DPTHead
 from .hybrid_fusion import HybridFusion
 
 from .util.loss import ScaleAndShiftInvariantLoss
-from utils.helpers import *
+from ..utils.helpers import *
 
-from utils.eval_metrics.metrics import compute_depth_metrics
+from ..utils.eval_metrics.metrics import compute_depth_metrics
 
 
 

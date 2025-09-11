@@ -5,16 +5,16 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
-from utils.init_setup import dist_init, setup_model
+from .utils.init_setup import dist_init, setup_model
 import logging
-from utils import logging_config
-from dataloaders.random_dataset import StreamDataset
+from .utils import logging_config
+from .dataloaders.random_dataset import StreamDataset
 from omegaconf import OmegaConf
 import matplotlib.pyplot as plt  # Added for depth visualization
 import cv2
 
 class FlashDepthProcessor:
-    def __init__(self, config_path="configs/flashdepth",stream_mode=False,save_depth_png=False,save_frame=False,max_frames=None):
+    def __init__(self, config_path="configs/flashdepth",url=None, stream_mode=False,save_depth_png=False,save_frame=False,max_frames=None):
         self.cfg = None
         self.process_dict = None
         self.run_dir = None
@@ -25,6 +25,7 @@ class FlashDepthProcessor:
         self.save_depth_png = save_depth_png
         self.max_frames = max_frames
         self.save_frame = None  # To store the latest original frame
+        self.url=url
         
     def _load_config(self, config_path):
         """Load configuration using OmegaConf."""
@@ -100,9 +101,12 @@ class FlashDepthProcessor:
         }
 
         # Resolve stream address
-        stream_addr = getattr(cfg.eval, 'stream_url', None) or getattr(cfg.eval, 'url', None)
-        if stream_addr is None:
-            raise ValueError('Stream address required: set cfg.eval.stream_url or cfg.eval.url')
+        if self.url is None:
+            stream_addr = getattr(cfg.eval, 'stream_url', None) or getattr(cfg.eval, 'url', None)
+            if stream_addr is None:
+                raise ValueError('Stream address required: set cfg.eval.stream_url or cfg.eval.url')
+        else:
+            stream_addr = self.url
 
         warmup = getattr(cfg.eval, 'stream_warmup_frames', 5)
         if self.max_frames is not None:
