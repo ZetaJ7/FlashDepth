@@ -345,6 +345,9 @@ class FlashDepth(nn.Module):
             # print('Stream depth shape:', pred_depth.shape)
             return pred_depth  # 返回 (H, W)
         
+        # External frame mode
+        
+        
         preds = []
 
         loss = 0

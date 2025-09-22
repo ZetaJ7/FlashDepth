@@ -227,3 +227,119 @@ class StreamDataset(Dataset):
                 self.cap.release()
         except Exception:
             pass
+
+class ExternalFrameDataset(Dataset):
+    def __init__(self, resolution=None, crop_type=None):
+        """Dataset for processing external frames that can be updated dynamically.
+        
+        Args:
+            resolution: Target resolution for processing
+            crop_type: Crop type for processing
+        """
+        self.resolution = resolution
+        self.crop_type = crop_type
+        self.frame = None
+        self.origin_frame = None
+
+    def update_frame(self, frame):
+        """Update the current frame to process.
+        
+        Args:
+            frame: Input frame as numpy array (H, W, C) or torch tensor
+        """
+        if not isinstance(frame, (np.ndarray, torch.Tensor)):
+            raise ValueError("Frame must be numpy array or torch tensor")
+        
+        self.frame = frame
+        
+        # Store original frame copy for output
+        if isinstance(frame, torch.Tensor):
+            self.origin_frame = frame.detach().cpu().numpy() if frame.is_cuda else frame.numpy()
+        else:
+            self.origin_frame = frame.copy()
+
+    def __len__(self):
+        return 1 if self.frame is not None else 0
+
+    def __getitem__(self, idx):
+        if self.frame is None:
+            raise RuntimeError("No frame available. Call update_frame() first.")
+        
+        if idx != 0:
+            raise IndexError("ExternalFrameDataset only contains one frame")
+        
+        frame = self.frame
+        
+        # Convert to numpy for processing if it's a tensor
+        if isinstance(frame, torch.Tensor):
+            frame = frame.detach().cpu().numpy()
+        
+        # Ensure frame is in correct format (H, W, C)
+        if frame.ndim == 3 and frame.shape[2] in [1, 3]:  # HWC format
+            pass  # Already correct
+        elif frame.ndim == 3 and frame.shape[0] in [1, 3]:  # CHW format
+            frame = np.transpose(frame, (1, 2, 0))  # CHW -> HWC
+        elif frame.ndim == 2:  # Grayscale
+            frame = np.expand_dims(frame, axis=2)  # HW -> HWC
+        else:
+            raise ValueError(f"Unsupported frame shape: {frame.shape}")
+
+        h, w = frame.shape[:2]
+        
+        # normalize/parse resolution if configured (allow numeric strings)
+        res_val = None
+        if self.resolution is not None:
+            try:
+                res_val = int(self.resolution)
+            except Exception:
+                import re
+                s = str(self.resolution).lower()
+                m = re.search(r"\d+", s)
+                if m:
+                    num = int(m.group())
+                    # support shorthand like '2k' -> 2*1024
+                    if 'k' in s:
+                        res_val = num * 1024
+                    else:
+                        res_val = num
+
+        if res_val is not None and max(h, w) > res_val:
+            scale = res_val / max(h, w)
+            res = (int(w * scale), int(h * scale))
+        else:
+            res = (w, h)
+
+        img, _ = _load_and_process_image(frame, resolution=res, crop_type=self.crop_type)
+        
+        # Normalize output to a torch tensor with shape (C, H, W)
+        if isinstance(img, torch.Tensor):
+            # Handle possible extra leading dims
+            if img.ndim == 4 and img.shape[0] == 1:
+                img = img.squeeze(0)
+            elif img.ndim == 5 and img.shape[0] == 1 and img.shape[1] == 1:
+                img = img.squeeze(0).squeeze(0)
+            # If img is (H, W, C) as tensor, permute to (C, H, W)
+            if img.ndim == 3 and img.shape[0] not in (1, 3):
+                # guess HWC
+                img = img.permute(2, 0, 1)
+        else:
+            # numpy array
+            if isinstance(img, np.ndarray):
+                if img.ndim == 3:
+                    # HWC -> CHW
+                    img = torch.from_numpy(img).permute(2, 0, 1)
+                elif img.ndim == 4 and img.shape[0] == 1:
+                    img = torch.from_numpy(img[0]).permute(2, 0, 1)
+                else:
+                    # fallback: convert and attempt to permute last dim to channels
+                    img = torch.from_numpy(img)
+                    if img.ndim == 3:
+                        img = img.permute(2, 0, 1)
+
+        img = img.float()
+
+        # sanity check spatial dims
+        if img.shape[-2] == 0 or img.shape[-1] == 0:
+            raise RuntimeError(f"Processed image has zero spatial dimension: {img.shape}")
+
+        return dict(batch=img.unsqueeze(0), frame=self.origin_frame)
